@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Http Request</string>
+    <string name="no_network_connection">No network connection found</string>
+</resources>
