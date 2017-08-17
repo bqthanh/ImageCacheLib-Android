@@ -153,8 +153,15 @@ public class MainActivity extends AppCompatActivity implements HttpRequestListen
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        mHttpRequest.setExitTasksEarly(false);
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
+        mHttpRequest.setExitTasksEarly(true);
     }
 
     @Override
