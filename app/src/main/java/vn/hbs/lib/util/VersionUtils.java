@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package vn.hbs.http.util;
+package vn.hbs.lib.util;
 
 import android.os.Build;
 import android.os.Build.VERSION_CODES;

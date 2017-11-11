@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package vn.hbs.provider;
+package vn.hbs.demo;
 
 import java.util.Arrays;
 import java.util.List;

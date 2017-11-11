@@ -1,4 +1,4 @@
-package vn.hbs.http;
+package vn.hbs.lib.http;
 
 import android.content.Context;
 import android.content.res.Resources;
@@ -14,33 +14,29 @@ import android.text.TextUtils;
 import android.widget.ImageView;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.UnsupportedEncodingException;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
-import java.net.URLEncoder;
-import java.util.Map;
 
-import vn.hbs.debug.DebugLog;
-import vn.hbs.http.cache.DiskLruCache;
-import vn.hbs.http.cache.ImageCache;
-import vn.hbs.http.util.ImageDecoder;
+import vn.hbs.lib.cache.DiskLruCache;
+import vn.hbs.lib.cache.ImageCache;
+import vn.hbs.lib.debug.DebugLog;
+import vn.hbs.lib.util.ImageDecoder;
 
 /**
  * Created by thanhbui on 2017/04/17.
  */
-public class HttpRequest {
-    private static final String TAG = HttpRequest.class.getSimpleName();
+public class ImageFetcher {
+    private static final String TAG = ImageFetcher.class.getSimpleName();
+
+    private static final String CONTENT_TYPE = "content-type";
+    private static final String CONTENT_TYPE_IMAGE = "image";
 
     private static final int FADE_IN_TIME = 200;
     private static final int IO_BUFFER_SIZE = 8 * 1024;
@@ -53,44 +49,33 @@ public class HttpRequest {
     private Context mContext;
     protected ImageCache mImageCache;
     private Bitmap mLoadingBitmap;
-    private HttpRequestListener mListener;
+    private ImageFetcherListener mListener;
 
-    private MyAsyncTask mTask;
     private final Object mPauseWorkLock = new Object();
 
-    public HttpRequest(Context context) {
+    /**
+     * Init ImageFetcher and an ImageCache to this to handle disk and memory bitmap caching.
+     */
+    public ImageFetcher(Context context, ImageCache.ImageCacheParams cacheParams) {
         this.mContext = context;
-        this.mImageCache = ImageCache.getInstance(mContext);
+        mImageCache = ImageCache.getInstance(cacheParams);
     }
 
-    /**
-     * Set listener for http request
-     */
-    public void setListener(HttpRequestListener listener) {
+    public void setListener(ImageFetcherListener listener) {
         this.mListener = listener;
     }
 
     /**
      * Set placeholder bitmap that shows when the the background thread is running.
-     *
-     * @param resId
      */
     public void setLoadingImage(int resId) {
         mLoadingBitmap = BitmapFactory.decodeResource(mContext.getResources(), resId);
     }
 
     /**
-     * Request data specified by the url parameter
-     */
-    public void request(String method, String urlString, Map<String, String> params) {
-        mTask = new MyAsyncTask(method, urlString, params, null);
-        mTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
-    }
-
-    /**
      * Request an image specified by the url parameter into an ImageView
      */
-    public void request(String urlString, ImageView imageView) {
+    public void load(String urlString, ImageView imageView, boolean diskCacheEnabled) {
         BitmapDrawable value = null;
 
         if (TextUtils.isEmpty(urlString)) {
@@ -105,11 +90,16 @@ public class HttpRequest {
             imageView.setImageDrawable(value);
 
             if (mListener != null) {
-                mListener.onRequestFinish(urlString, value, HttpURLConnection.HTTP_OK);
+                mListener.onImageLoaded(urlString, true, ImageFetcherListener.MEMORY_CACHE_HIT);
             }
         } else if (cancelPotentialWork(urlString, imageView)) {
-            mTask = new MyAsyncTask(HttpHeader.METHOD_GET, urlString, null, imageView);
-
+            if (mImageCache != null
+                    && !mImageCache.getImageCacheParams().getDiskCacheEnabled()) {
+                mImageCache.getImageCacheParams().setDiskCacheEnabled(true);
+                mImageCache.initDiskCache();
+            }
+            MyAsyncTask mTask =
+                    new MyAsyncTask(urlString, imageView, diskCacheEnabled);
             final AsyncDrawable asyncDrawable =
                     new AsyncDrawable(mContext.getResources(), mLoadingBitmap, mTask);
             imageView.setImageDrawable(asyncDrawable);
@@ -139,8 +129,7 @@ public class HttpRequest {
     }
 
     /**
-     * @param imageView Any imageView
-     * @return Retrieve the currently active work task (if any) associated with this imageView.
+     * Retrieve the currently active work task (if any) associated with this imageView.
      * null if there is no such task.
      */
     private static MyAsyncTask getBitmapWorkerTask(ImageView imageView) {
@@ -158,27 +147,15 @@ public class HttpRequest {
      * The actual AsyncTask that will asynchronously process the image.
      */
     private class MyAsyncTask extends AsyncTask<Void, Void, Object> {
-        private String mMethod;
         private String mUrl;
-        private Map<String, String> mParams;
         private final WeakReference<ImageView> imageViewReference;
+        private boolean mDiskCacheEnabled;
+        private int mCacheState = ImageFetcherListener.CACHE_MISS;
 
-        private int mStatus;
-
-        public MyAsyncTask(String method, String url, Map<String, String> params, ImageView imageView) {
-            this.mMethod = method;
+        public MyAsyncTask(String url, ImageView imageView, boolean diskCacheEnabled) {
             this.mUrl = url;
-            this.mParams = params;
             this.imageViewReference = new WeakReference(imageView);
-        }
-
-        @Override
-        protected void onPreExecute() {
-            super.onPreExecute();
-            if (HttpHeader.METHOD_GET.equals(mMethod)
-                    && mParams != null) {
-                mUrl = String.format("%s?%s", mUrl, mapToQuery(this.mParams));
-            }
+            this.mDiskCacheEnabled = diskCacheEnabled;
         }
 
         /**
@@ -186,15 +163,15 @@ public class HttpRequest {
          */
         @Override
         protected Object doInBackground(Void... params) {
-            Bitmap bitmap;
-            BitmapDrawable drawable;
+            Object retObj = null;
 
             // Wait here if work is paused and the task is not cancelled
             synchronized (mPauseWorkLock) {
                 while (mPauseWork && !isCancelled()) {
                     try {
                         mPauseWorkLock.wait();
-                    } catch (InterruptedException e) {}
+                    } catch (InterruptedException e) {
+                    }
                 }
             }
 
@@ -203,11 +180,15 @@ public class HttpRequest {
             // to this task and our "exit early" flag is not set then try and fetch the bitmap from
             // the cache
             if (mImageCache != null
+                    && mDiskCacheEnabled
+                    && mImageCache.getDiskLruCache() != null
                     && !isCancelled()
                     && getAttachedImageView() != null
                     && !mExitTasksEarly) {
-                bitmap = mImageCache.getBitmapFromDiskCache(mUrl);
+                int[] measure = getImageViewMeasures(getAttachedImageView());
+                Bitmap bitmap = mImageCache.getBitmapFromDiskCache(mUrl, measure);
                 if (bitmap != null) {
+                    mCacheState = ImageFetcherListener.DISK_CACHE_HIT;
                     return convertToBitmapDrawable(bitmap);
                 }
             }
@@ -216,41 +197,13 @@ public class HttpRequest {
             try {
                 URL url = new URL(mUrl);
                 urlConnection = (HttpURLConnection) url.openConnection();
-                if (!mMethod.equals(HttpHeader.METHOD_GET)) {
-                    urlConnection.setDoOutput(true);
-                    if (mParams != null) {
-                        OutputStreamWriter writer = new OutputStreamWriter(urlConnection.getOutputStream());
-                        writer.write(mapToQuery(mParams));
-                        writer.close();
-                    }
-                }
-
-                String contentType;
-                InputStream inputStream;
-
                 urlConnection.connect();
 
-                mStatus = urlConnection.getResponseCode();
-                contentType = urlConnection.getHeaderField(HttpHeader.CONTENT_TYPE);
-
-                if (contentType.contains(HttpHeader.CONTENT_TYPE_IMAGE)) {
-                    bitmap = processBitmap(mUrl, urlConnection);
-                    drawable = convertToBitmapDrawable(bitmap);
-                    return drawable;
-                } else {
-                    inputStream = urlConnection.getInputStream();
-                    String encoding = urlConnection.getContentEncoding();
-                    if (encoding == null) {
-                        encoding = HttpHeader.ENCODING_DEFAULT;
+                if (urlConnection.getHeaderField(CONTENT_TYPE).contains(CONTENT_TYPE_IMAGE)) {
+                    if (!mExitTasksEarly) {
+                        Bitmap bitmap = processBitmap(mUrl, urlConnection);
+                        retObj = convertToBitmapDrawable(bitmap);
                     }
-                    BufferedReader reader =
-                            new BufferedReader(new InputStreamReader(inputStream, encoding));
-                    StringBuilder stringBuilder = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        stringBuilder.append(line);
-                    }
-                    return stringBuilder.toString();
                 }
             } catch (IOException e) {
                 DebugLog.e(TAG, "IO exception: " + e);
@@ -262,7 +215,7 @@ public class HttpRequest {
                 }
             }
 
-            return null;
+            return retObj;
         }
 
         /**
@@ -270,17 +223,22 @@ public class HttpRequest {
          */
         @Override
         protected void onPostExecute(Object value) {
+            boolean success = false;
+
             // if cancel was called on this task or the "exit early" flag is set then we're done
             if (isCancelled() || mExitTasksEarly) {
                 value = null;
             }
+
             final ImageView imageView = getAttachedImageView();
             if (value instanceof BitmapDrawable
                     && imageView != null) {
+                success = true;
                 setImageDrawable(imageView, (BitmapDrawable) value);
             }
+
             if (mListener != null) {
-                mListener.onRequestFinish(mUrl, value, mStatus);
+                mListener.onImageLoaded(mUrl, success, mCacheState);
             }
         }
 
@@ -302,7 +260,7 @@ public class HttpRequest {
                 // Running on Honeycomb or newer, so wrap in a standard BitmapDrawable
                 drawable = new BitmapDrawable(mContext.getResources(), bitmap);
                 if (mImageCache != null) {
-                    mImageCache.addBitmapToCache(mUrl, drawable);
+                    mImageCache.addBitmapToCache(mUrl, drawable, mDiskCacheEnabled);
                 }
             }
 
@@ -325,109 +283,120 @@ public class HttpRequest {
         }
 
         /**
-         * Subclasses should override this to define any processing or work that must happen to produce
-         * the final bitmap. This will be executed in a background thread and be long running. For
-         * example, you could resize a large bitmap here, or pull down an image from the network.
-         *
-         * @param urlString The data to identify which image to process
-         * @return The processed bitmap
+         * Process bitmap in a background thread and be long running
          */
         private Bitmap processBitmap(String urlString, HttpURLConnection urlConnection) {
-            final String key;
+            Bitmap bitmap;
             DiskLruCache diskLruCache;
-            FileDescriptor fileDescriptor = null;
-            FileInputStream fileInputStream = null;
             DiskLruCache.Snapshot snapshot;
+            FileDescriptor fileDescriptor = null;
 
-            diskLruCache = mImageCache.getDiskLruCache();
-            key = ImageCache.hashKeyForDisk(urlString);
+            byte[] byteArray = downloadByteArray(urlConnection);
 
-            try {
-                snapshot = diskLruCache.get(key);
-                if (snapshot == null) {
-                    DiskLruCache.Editor editor = diskLruCache.edit(key);
+            if (mExitTasksEarly
+                    || byteArray == null
+                    || byteArray.length == 0) {
+                return null;
+            }
 
-                    if (editor != null) {
-                        if (downloadUrlToStream(urlConnection,
-                                editor.newOutputStream(DISK_CACHE_INDEX))) {
+            if (mImageCache != null
+                    && mDiskCacheEnabled
+                    && mImageCache.getDiskLruCache() != null) {
+                FileInputStream fileInputStream = null;
+
+                diskLruCache = mImageCache.getDiskLruCache();
+                String key = ImageCache.hashKeyForDisk(urlString);
+
+                try {
+                    snapshot = diskLruCache.get(key);
+                    if (snapshot == null) {
+                        DiskLruCache.Editor editor = diskLruCache.edit(key);
+                        if (editor != null) {
+                            OutputStream out = editor.newOutputStream(DISK_CACHE_INDEX);
+                            out.write(byteArray);
                             editor.commit();
-                        } else {
-                            editor.abort();
+                            out.close();
+                        }
+                        snapshot = diskLruCache.get(key);
+                    }
+
+                    if (snapshot != null) {
+                        fileInputStream =
+                                (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
+                        fileDescriptor = fileInputStream.getFD();
+                    }
+
+                } catch (IOException e) {
+                    DebugLog.e(TAG, "Process bitmap: " + e.getLocalizedMessage());
+                } catch (IllegalStateException e) {
+                    DebugLog.e(TAG, "Process bitmap: " + e.getLocalizedMessage());
+                } finally {
+                    if (fileDescriptor == null && fileInputStream != null) {
+                        try {
+                            fileInputStream.close();
+                        } catch (IOException e) {
                         }
                     }
-                    snapshot = diskLruCache.get(key);
-                }
-
-                if (snapshot != null) {
-                    fileInputStream =
-                            (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
-                    fileDescriptor = fileInputStream.getFD();
-                }
-            } catch (IOException e) {
-                DebugLog.e(TAG, "Process bitmap: " + e.getLocalizedMessage());
-            } catch (IllegalStateException e) {
-                DebugLog.e(TAG, "Process bitmap: " + e.getLocalizedMessage());
-            } finally {
-                if (fileDescriptor == null && fileInputStream != null) {
-                    try {
-                        fileInputStream.close();
-                    } catch (IOException e) {}
                 }
             }
 
-            Bitmap bitmap = null;
+            int[] measure = getImageViewMeasures(getAttachedImageView());
             if (fileDescriptor != null) {
-                int reqWidth = Integer.MAX_VALUE, reqHeight = Integer.MAX_VALUE;
-
-                if (getAttachedImageView() != null) {
-                    reqWidth = getAttachedImageView().getMeasuredWidth();
-                    reqHeight = getAttachedImageView().getMeasuredHeight();
-                }
-
-                bitmap = ImageDecoder.decodeSampledBitmapFromDescriptor(fileDescriptor, reqWidth,
-                        reqHeight, mImageCache);
-            }
-            if (fileInputStream != null) {
-                try {
-                    fileInputStream.close();
-                } catch (IOException e) {}
+                bitmap = ImageDecoder.decodeSampledBitmapFromDescriptor(fileDescriptor, measure[0], measure[1], mImageCache);
+            } else {
+                bitmap = ImageDecoder.decodeSampledBitmapFromByteArray(byteArray, measure[0], measure[1], mImageCache);
             }
             return bitmap;
         }
 
-        /**
-         * Download a bitmap from a URL and write the content to an output stream.
-         */
-        private boolean downloadUrlToStream(HttpURLConnection urlConnection, OutputStream outputStream) {
-            BufferedOutputStream out = null;
-            BufferedInputStream in = null;
-
-            try {
-                in = new BufferedInputStream(urlConnection.getInputStream(), IO_BUFFER_SIZE);
-                out = new BufferedOutputStream(outputStream, IO_BUFFER_SIZE);
-
-                int b;
-                while ((b = in.read()) != -1) {
-                    out.write(b);
-                }
-                return true;
-            } catch (final MalformedURLException e) {
-                DebugLog.e(TAG, "Url exception: " + e.getLocalizedMessage());
-            } catch (IOException e) {
-                DebugLog.e(TAG, "IO exception string value: " + e.getLocalizedMessage());
+        private int[] getImageViewMeasures(ImageView imageView) {
+            if (imageView == null) {
+                return new int[] {Integer.MAX_VALUE, Integer.MAX_VALUE};
             }
-            finally {
-                try {
-                    if (out != null) {
-                        out.close();
-                    }
-                    if (in != null) {
-                        in.close();
-                    }
-                } catch (final IOException e) {}
+            int[] measure = new int[] {imageView.getMeasuredWidth(), imageView.getMeasuredHeight()};
+            if (measure[0] <= 0
+                    || measure[1] <= 0) {
+                measure = new int[] {Integer.MAX_VALUE, Integer.MAX_VALUE};
             }
-            return false;
+            return measure;
         }
+    }
+
+    /**
+     * Download a bitmap from a URL in byte array
+     */
+    private byte[] downloadByteArray(HttpURLConnection urlConnection) {
+        BufferedInputStream inputStream = null;
+        ByteArrayOutputStream outputStream = null;
+        byte[] byteArray = null;
+
+        try {
+            inputStream = new BufferedInputStream(urlConnection.getInputStream(), IO_BUFFER_SIZE);
+            outputStream = new ByteArrayOutputStream(IO_BUFFER_SIZE);
+
+            int b;
+            while ((b = inputStream.read()) != -1) {
+                outputStream.write(b);
+            }
+            byteArray = outputStream.toByteArray();
+
+        } catch (final MalformedURLException e) {
+            DebugLog.e(TAG, "Url exception: " + e.getLocalizedMessage());
+        } catch (IOException e) {
+            DebugLog.e(TAG, "IO exception string value: " + e.getLocalizedMessage());
+        }
+        finally {
+            try {
+                if (outputStream != null) {
+                    outputStream.close();
+                }
+                if (inputStream != null) {
+                    inputStream.close();
+                }
+            } catch (final IOException e) {}
+        }
+
+        return byteArray;
     }
 
     /**
@@ -477,31 +446,6 @@ public class HttpRequest {
     }
 
     /**
-     * Convert the map to an array of string for query string
-     */
-    private String mapToQuery(Map<String, String> map) {
-        StringBuilder sb = new StringBuilder();
-        String separator = "&";
-        int count = 0;
-
-        if (map != null) {
-            for (Map.Entry<String, String> e : map.entrySet()) {
-                if (count > 0) {
-                    sb.append(separator);
-                }
-                try {
-                    sb.append(e.getKey() + "=" + URLEncoder.encode(e.getValue(), HttpHeader.ENCODING_DEFAULT));
-                } catch (UnsupportedEncodingException ex) {
-                    DebugLog.i(TAG, "Exception: " + ex.getLocalizedMessage());
-                }
-                count++;
-            }
-        }
-
-        return sb.toString();
-    }
-
-    /**
      * Pause any ongoing background work. This can be used as a temporary
      * measure to improve performance. For example background work could
      * be paused when a ListView or GridView is being scrolled using a
@@ -523,32 +467,37 @@ public class HttpRequest {
     }
 
     /**
-     * Cancels any pending work attached to the provided ImageView.
-     * @param imageView
+     * Cancels any pending work attached to the provided ImageView
      */
-    public void cancelWork(ImageView imageView) {
+    public boolean cancelWork(ImageView imageView) {
         final MyAsyncTask bitmapWorkerTask = getBitmapWorkerTask(imageView);
         if (bitmapWorkerTask != null) {
             bitmapWorkerTask.cancel(true);
-            final Object url = bitmapWorkerTask.mUrl;
-            DebugLog.i(TAG, "Cancelled work: " + url);
+            return true;
         }
+        return false;
     }
 
     /**
-     * You should implements this on onPause and onResume lifecyfile
+     * You should implements this on onPause and onResume lifecycle
      */
     public void setExitTasksEarly(boolean exitTasksEarly) {
         mExitTasksEarly = exitTasksEarly;
         setPauseWork(false);
     }
 
+    /**
+     * Clear all data in memory cache and disk cache
+     */
     public void clearCache() {
         if (mImageCache != null) {
             mImageCache.clearCache();
         }
     }
 
+    /**
+     * You should close disk cache when not use
+     */
     public void closeCache() {
         if (mImageCache != null) {
             mImageCache.closeCache();

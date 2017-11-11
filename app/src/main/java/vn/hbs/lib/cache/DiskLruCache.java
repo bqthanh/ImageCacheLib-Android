@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package vn.hbs.http.cache;
+package vn.hbs.lib.cache;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedWriter;

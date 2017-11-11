@@ -1,4 +1,4 @@
-package vn.hbs.http.util;
+package vn.hbs.lib.util;
 
 import android.content.Context;
 import android.net.ConnectivityManager;
