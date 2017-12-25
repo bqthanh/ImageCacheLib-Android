@@ -1,4 +1,4 @@
-#ImageCacheLib_Android
+# ImageCacheLib_Android
 
 #### Library overview
 
@@ -16,17 +16,14 @@ It is mandatory to initialize ImageFetcher to the onCreate class of the class th
 
 Declare ImageCacheParams
 > public ImageCacheParams (Context context, String diskCacheDirectoryName)
-
 > diskCacheDirectoryName: The name of the folder where the acquired image is saved
 
 Declare whether to use DiskCache
 > public void setDiskCacheEnabled (boolean enabled)
-
 > Regardless of whether DiskCache is used or not, MemoryCache initializes as MemoryCacheParams initializes
 
 Declare ImageFetcher
 > public ImageFetcher (Context context, ImageCache.ImageCacheParams cacheParams)
-
 > cacheParams is null, do not use MemoryCache and DiskCache
 
 Specify the image to display while acquiring the image
@@ -63,7 +60,7 @@ A case
 mImageFetcher.load (image_url, mImageView, true);
 ```
 
-#####4. Task is completed early, ignoring processing
+##### 4. Task is completed early, ignoring processing
 > public void setExitTasksEarly (boolean exitTasksEarly)
 
 existTaskEarly
